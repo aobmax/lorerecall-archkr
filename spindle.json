@@ -1,9 +1,9 @@
 {
-  "identifier": "lore_recall",
+  "identifier": "lorecall_bleh",
   "version": "1.0.0-TESTING",
-  "name": "Lore Recall",
+  "name": "Lorecall Bleh",
   "author": "Archkr",
-  "github": "https://github.com/archkr/Lumiverse-LoreRecall",
+  "github": "https://github.com/aobmax/lorerecall-archkr",
   "homepage": "https://lumiverse.chat",
   "description": "Tree-aware retrieval over managed world books with per-character bindings.",
   "permissions": ["world_books", "characters", "chats", "chat_mutation", "generation", "interceptor"],

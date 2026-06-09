@@ -9,7 +9,7 @@ import type {
   LegacyEntryTreeMeta,
 } from "./types";
 
-export const EXTENSION_KEY = "lore_recall";
+export const EXTENSION_KEY = "lorecall_bleh";
 export const TREE_VERSION = 2 as const;
 export const ROOT_NODE_ID = "root";
 

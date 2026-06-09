@@ -1,6 +1,6 @@
 // @bun
 // src/shared.ts
-var EXTENSION_KEY = "lore_recall";
+var EXTENSION_KEY = "lorecall_bleh";
 var TREE_VERSION = 2;
 var ROOT_NODE_ID = "root";
 var DEFAULT_GLOBAL_SETTINGS = {
