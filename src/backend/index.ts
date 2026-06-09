@@ -919,6 +919,14 @@ spindle.registerInterceptor(async (messages, context) => {
 // the marker, and it removes the double-injection native keyword firing would
 // otherwise add. Requires the managed book attached; reported in the feed if not.
 // ---------------------------------------------------------------------------
+// Fork: feature-detect the host's World Info Interceptor API before registering.
+// The pinned spindle-types only declare it via a local ambient augmentation, but
+// a host that predates the API won't implement it at runtime; calling it
+// unconditionally throws during load, so the entire backend — including the
+// default assembled-injection path and the frontend message handler below —
+// fails to register and the extension never activates. Guarding keeps the
+// extension active and degrades native mode to a logged no-op.
+if (typeof spindle.registerWorldInfoInterceptor === "function") {
 spindle.registerWorldInfoInterceptor(async (ctx) => {
   const chatId = ctx.chatId;
   const userId = ctx.userId ?? resolveUserId(chatId);
@@ -1042,6 +1050,11 @@ spindle.registerWorldInfoInterceptor(async (ctx) => {
     return;
   }
 }, 95);
+} else {
+  spindle.log.warn(
+    "Lore Recall: host has no World Info Interceptor API; native injection mode is disabled (assembled injection still works).",
+  );
+}
 
 spindle.onFrontendMessage(async (payload, userId) => {
   setLastFrontendUserId(userId);

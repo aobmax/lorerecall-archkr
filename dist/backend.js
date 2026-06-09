@@ -6751,118 +6751,122 @@ spindle.registerInterceptor(async (messages, context) => {
     return messages;
   }
 }, 95);
-spindle.registerWorldInfoInterceptor(async (ctx) => {
-  const chatId = ctx.chatId;
-  const userId = ctx.userId ?? resolveUserId(chatId);
-  if (!chatId || !userId)
-    return;
-  let sessionId = null;
-  let sessionStarted = false;
-  let sessionFinished = false;
-  try {
-    await ensureStorageFolders(userId);
-    const settings = await loadGlobalSettings(userId);
-    if (!settings.enabled)
+if (typeof spindle.registerWorldInfoInterceptor === "function") {
+  spindle.registerWorldInfoInterceptor(async (ctx) => {
+    const chatId = ctx.chatId;
+    const userId = ctx.userId ?? resolveUserId(chatId);
+    if (!chatId || !userId)
       return;
-    const chat = await spindle.chats.get(chatId, userId);
-    if (!chat?.character_id)
-      return;
-    const character = await spindle.characters.get(chat.character_id, userId);
-    if (!character)
-      return;
-    const config = await loadCharacterConfig(chat.character_id, userId, character);
-    if (!config.enabled || !config.managedBookIds.length)
-      return;
-    if (config.injectionMode !== "native")
-      return;
-    const { runtimeBooks } = await getRuntimeBooks(config.managedBookIds, character.world_book_ids, userId);
-    if (!runtimeBooks.length)
-      return;
-    const interceptorMessages = ctx.messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: m.content }));
-    if (!interceptorMessages.length)
-      return;
-    sessionId = `retrieval:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-    const handleProgress = (event) => {
-      if (!sessionId)
+    let sessionId = null;
+    let sessionStarted = false;
+    let sessionFinished = false;
+    try {
+      await ensureStorageFolders(userId);
+      const settings = await loadGlobalSettings(userId);
+      if (!settings.enabled)
         return;
-      switch (event.type) {
-        case "start":
-          sessionStarted = true;
-          beginRetrievalSession(userId, chatId, sessionId, event);
-          scheduleLiveStatePush(userId, chatId);
+      const chat = await spindle.chats.get(chatId, userId);
+      if (!chat?.character_id)
+        return;
+      const character = await spindle.characters.get(chat.character_id, userId);
+      if (!character)
+        return;
+      const config = await loadCharacterConfig(chat.character_id, userId, character);
+      if (!config.enabled || !config.managedBookIds.length)
+        return;
+      if (config.injectionMode !== "native")
+        return;
+      const { runtimeBooks } = await getRuntimeBooks(config.managedBookIds, character.world_book_ids, userId);
+      if (!runtimeBooks.length)
+        return;
+      const interceptorMessages = ctx.messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: m.content }));
+      if (!interceptorMessages.length)
+        return;
+      sessionId = `retrieval:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      const handleProgress = (event) => {
+        if (!sessionId)
           return;
-        case "item":
-          if (!sessionStarted)
+        switch (event.type) {
+          case "start":
+            sessionStarted = true;
+            beginRetrievalSession(userId, chatId, sessionId, event);
+            scheduleLiveStatePush(userId, chatId);
             return;
-          appendRetrievalSessionItem(userId, chatId, sessionId, event.item);
-          scheduleLiveStatePush(userId, chatId);
-          return;
-        case "finish":
-          if (!sessionStarted)
+          case "item":
+            if (!sessionStarted)
+              return;
+            appendRetrievalSessionItem(userId, chatId, sessionId, event.item);
+            scheduleLiveStatePush(userId, chatId);
             return;
-          sessionFinished = true;
-          finishRetrievalSession(userId, chatId, sessionId, event);
-          scheduleLiveStatePush(userId, chatId);
-          return;
+          case "finish":
+            if (!sessionStarted)
+              return;
+            sessionFinished = true;
+            finishRetrievalSession(userId, chatId, sessionId, event);
+            scheduleLiveStatePush(userId, chatId);
+            return;
+        }
+      };
+      const preview = await buildRetrievalPreview(interceptorMessages, settings, config, runtimeBooks, userId, {
+        isActual: true,
+        capturedAt: Date.now(),
+        reportProgress: handleProgress,
+        controllerBudgetMs: WORLD_INFO_CONTROLLER_BUDGET_MS
+      });
+      previewCache.set(getPreviewCacheKey(userId, chatId), preview);
+      scheduleLiveStatePush(userId, chatId);
+      if (!preview)
+        return;
+      const managedBookIds = new Set(config.managedBookIds);
+      const selectedEntryIds = new Set(preview.injectedNodes.map((node) => node.entryId));
+      const candidateIds = new Set(ctx.entries.map((entry) => entry.id));
+      const forced = [];
+      const enabled = [];
+      const disabled = [];
+      for (const entry of ctx.entries) {
+        if (selectedEntryIds.has(entry.id)) {
+          forced.push(entry.id);
+          if (entry.disabled)
+            enabled.push(entry.id);
+        } else if (managedBookIds.has(entry.world_book_id) && config.nativeDisableUnselected) {
+          disabled.push(entry.id);
+        }
       }
-    };
-    const preview = await buildRetrievalPreview(interceptorMessages, settings, config, runtimeBooks, userId, {
-      isActual: true,
-      capturedAt: Date.now(),
-      reportProgress: handleProgress,
-      controllerBudgetMs: WORLD_INFO_CONTROLLER_BUDGET_MS
-    });
-    previewCache.set(getPreviewCacheKey(userId, chatId), preview);
-    scheduleLiveStatePush(userId, chatId);
-    if (!preview)
+      const unreachable = [...selectedEntryIds].filter((id) => !candidateIds.has(id));
+      if (unreachable.length && sessionId && sessionStarted) {
+        appendRetrievalSessionItem(userId, chatId, sessionId, {
+          id: `issue:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+          kind: "issue",
+          label: "Native injection: entries not active",
+          summary: `${unreachable.length} selected entr${unreachable.length === 1 ? "y is" : "ies are"} not active world-info candidate(s). Attach the managed book to the character so native injection can place them (e.g. at {{wi_marker}}).`,
+          timestamp: Date.now(),
+          phase: "inject",
+          tone: "warn"
+        });
+        scheduleLiveStatePush(userId, chatId);
+        spindle.log.warn(`Lore Recall native injection could not reach ${unreachable.length} selected entr${unreachable.length === 1 ? "y" : "ies"} for chat ${chatId}; the managed book is likely not attached.`);
+      }
+      spindle.log.info(`Lore Recall native injection for chat ${chatId}: forced=${forced.length}, disabled=${disabled.length}, enabled=${enabled.length}.`);
+      return { forced, enabled, disabled };
+    } catch (error) {
+      if (sessionId && sessionStarted && !sessionFinished) {
+        finishRetrievalSession(userId, chatId, sessionId, {
+          type: "finish",
+          timestamp: Date.now(),
+          status: "failed",
+          controllerUsed: false,
+          resolvedConnectionId: null,
+          fallbackReason: error instanceof Error ? error.message : String(error)
+        });
+        scheduleLiveStatePush(userId, chatId);
+      }
+      spindle.log.warn(`Lore Recall world-info interceptor failed: ${error instanceof Error ? error.message : String(error)}`);
       return;
-    const managedBookIds = new Set(config.managedBookIds);
-    const selectedEntryIds = new Set(preview.injectedNodes.map((node) => node.entryId));
-    const candidateIds = new Set(ctx.entries.map((entry) => entry.id));
-    const forced = [];
-    const enabled = [];
-    const disabled = [];
-    for (const entry of ctx.entries) {
-      if (selectedEntryIds.has(entry.id)) {
-        forced.push(entry.id);
-        if (entry.disabled)
-          enabled.push(entry.id);
-      } else if (managedBookIds.has(entry.world_book_id) && config.nativeDisableUnselected) {
-        disabled.push(entry.id);
-      }
     }
-    const unreachable = [...selectedEntryIds].filter((id) => !candidateIds.has(id));
-    if (unreachable.length && sessionId && sessionStarted) {
-      appendRetrievalSessionItem(userId, chatId, sessionId, {
-        id: `issue:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-        kind: "issue",
-        label: "Native injection: entries not active",
-        summary: `${unreachable.length} selected entr${unreachable.length === 1 ? "y is" : "ies are"} not active world-info candidate(s). Attach the managed book to the character so native injection can place them (e.g. at {{wi_marker}}).`,
-        timestamp: Date.now(),
-        phase: "inject",
-        tone: "warn"
-      });
-      scheduleLiveStatePush(userId, chatId);
-      spindle.log.warn(`Lore Recall native injection could not reach ${unreachable.length} selected entr${unreachable.length === 1 ? "y" : "ies"} for chat ${chatId}; the managed book is likely not attached.`);
-    }
-    spindle.log.info(`Lore Recall native injection for chat ${chatId}: forced=${forced.length}, disabled=${disabled.length}, enabled=${enabled.length}.`);
-    return { forced, enabled, disabled };
-  } catch (error) {
-    if (sessionId && sessionStarted && !sessionFinished) {
-      finishRetrievalSession(userId, chatId, sessionId, {
-        type: "finish",
-        timestamp: Date.now(),
-        status: "failed",
-        controllerUsed: false,
-        resolvedConnectionId: null,
-        fallbackReason: error instanceof Error ? error.message : String(error)
-      });
-      scheduleLiveStatePush(userId, chatId);
-    }
-    spindle.log.warn(`Lore Recall world-info interceptor failed: ${error instanceof Error ? error.message : String(error)}`);
-    return;
-  }
-}, 95);
+  }, 95);
+} else {
+  spindle.log.warn("Lore Recall: host has no World Info Interceptor API; native injection mode is disabled (assembled injection still works).");
+}
 spindle.onFrontendMessage(async (payload, userId) => {
   setLastFrontendUserId(userId);
   const message = payload;
