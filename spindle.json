@@ -1,9 +1,9 @@
 {
-  "identifier": "lore_recall",
+  "identifier": "lore_recall_fork",
   "version": "1.1.0-fork",
-  "name": "Lore Recall+",
+  "name": "Lore Recall+ (Fork)",
   "author": "Archkr (fork)",
-  "github": "https://github.com/archkr/Lumiverse-LoreRecall",
+  "github": "https://github.com/aobmax/lorerecall-archkr",
   "homepage": "https://lumiverse.chat",
   "description": "Tree-aware retrieval over managed world books. Fork of 1.0.0-TESTING: + context token-budget window, + selectable injection position incl. {{wi_marker}}, + CJK matching, + tail-preserving truncation, + controller reasoning toggle.",
   "permissions": [
