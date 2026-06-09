@@ -1,0 +1,1172 @@
+declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
+
+import type { ConnectionProfileDTO, InterceptorResultDTO, LlmMessageDTO } from "lumiverse-spindle-types";
+import type {
+  CharacterRetrievalConfig,
+  FrontendState,
+  FrontendToBackend,
+  OperationIssue,
+  OperationKind,
+  OperationUpdate,
+  RetrievalFeedItem,
+  RetrievalFeedState,
+  RetrievalPreview,
+  RetrievalProgressEvent,
+  RetrievalSession,
+} from "../types";
+import type { RuntimeBook } from "./contracts";
+import { buildRetrievalPreview, type DynamicRetrievalFeedbackSnapshot } from "./retrieval";
+import {
+  type OperationContext,
+  type OperationOutcome,
+  applySuggestedBooks,
+  assignEntries,
+  buildDiagnostics,
+  buildTreeFromMetadata,
+  buildTreeWithLlm,
+  createCategory,
+  deleteCategory,
+  exportSnapshot,
+  importSnapshot,
+  moveCategory,
+  patchEntryFlags,
+  regenerateSummaries,
+  updateCategory,
+  updateEntryMeta,
+} from "./operations";
+import {
+  ensureStorageFolders,
+  readChatIdFromMessage,
+  rememberChatUser,
+  resolveUserId,
+  send,
+  setLastFrontendUserId,
+} from "./runtime";
+import {
+  buildConnectionOption,
+  computeSuggestedBookIds,
+  getRuntimeBooks,
+  invalidateWorldBookListCache,
+  listAllWorldBooks,
+  loadCharacterConfig,
+  loadGlobalSettings,
+  saveBookConfig,
+  saveCharacterConfig,
+  saveGlobalSettings,
+  toBookSummary,
+} from "./storage";
+
+const LORE_RECALL_BREAKDOWN_NAME = "Retrieved Lore";
+
+// Fork: world-info interceptor runs in a hard 10s host budget, so the native
+// path caps the controller under it and degrades to the fast deterministic path.
+const WORLD_INFO_CONTROLLER_BUDGET_MS = 8500;
+
+// Fork: place the assembled lore block at the configured spot in the outgoing
+// message array. The breakdown messageIndex tracks the insertion point.
+function placeAssembledInjection(
+  messages: LlmMessageDTO[],
+  text: string,
+  config: CharacterRetrievalConfig,
+): InterceptorResultDTO {
+  const injected = { role: config.injectionRole, content: text } as LlmMessageDTO;
+  let index: number;
+  let outgoing: LlmMessageDTO[];
+  switch (config.injectionPosition) {
+    case "system_end":
+      index = messages.length;
+      outgoing = [...messages, injected];
+      break;
+    case "depth": {
+      index = Math.max(0, messages.length - Math.max(0, config.injectionDepth));
+      outgoing = [...messages.slice(0, index), injected, ...messages.slice(index)];
+      break;
+    }
+    case "system_start":
+    default:
+      index = 0;
+      outgoing = [injected, ...messages];
+      break;
+  }
+  return { messages: outgoing, breakdown: [{ messageIndex: index, name: LORE_RECALL_BREAKDOWN_NAME }] };
+}
+
+const CONNECTION_CACHE_TTL_MS = 5000;
+const RETRIEVAL_FEED_SESSION_LIMIT = 25;
+const RETRIEVAL_FEED_PUSH_DELAY_MS = 180;
+const connectionCache = new Map<string, { expiresAt: number; connections: ConnectionProfileDTO[] }>();
+const latestStateSequence = new Map<string, number>();
+const previewCache = new Map<string, RetrievalPreview | null>();
+const retrievalFeedCache = new Map<string, RetrievalFeedState>();
+const scheduledStatePushes = new Map<string, ReturnType<typeof setTimeout>>();
+const dynamicFeedbackByChat = new Map<string, ChatDynamicFeedbackState>();
+
+const DYNAMIC_FEEDBACK_RECENT_WINDOW = 3;
+
+interface StateBuildEnvelope {
+  state: FrontendState;
+}
+
+interface DynamicFeedbackRecord {
+  entryId: string;
+  label: string;
+  aliases: string[];
+  keys: string[];
+}
+
+interface ChatDynamicFeedbackState {
+  pending: DynamicFeedbackRecord[];
+  entries: DynamicRetrievalFeedbackSnapshot["entries"];
+  recentInjectionEntryIds: string[][];
+}
+
+async function resolveActiveChat(userId: string, chatId?: string | null) {
+  if (chatId) return spindle.chats.get(chatId, userId);
+  return spindle.chats.getActive(userId);
+}
+
+async function listConnectionsCached(userId: string): Promise<ConnectionProfileDTO[]> {
+  const cached = connectionCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.connections;
+  }
+
+  const connections = await spindle.connections.list(userId).catch(() => [] as ConnectionProfileDTO[]);
+  connectionCache.set(userId, {
+    expiresAt: Date.now() + CONNECTION_CACHE_TTL_MS,
+    connections,
+  });
+  return connections;
+}
+
+function getPreviewCacheKey(userId: string, chatId: string): string {
+  return `${userId}:${chatId}`;
+}
+
+function getDynamicFeedbackState(cacheKey: string): ChatDynamicFeedbackState {
+  const existing = dynamicFeedbackByChat.get(cacheKey);
+  if (existing) return existing;
+  const created: ChatDynamicFeedbackState = {
+    pending: [],
+    entries: {},
+    recentInjectionEntryIds: [],
+  };
+  dynamicFeedbackByChat.set(cacheKey, created);
+  return created;
+}
+
+function normalizeFeedbackText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[\u2019']/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function feedbackTextIncludes(normalizedText: string, phrase: string): boolean {
+  const normalizedPhrase = normalizeFeedbackText(phrase);
+  if (normalizedPhrase.length < 3) return false;
+  return ` ${normalizedText} `.includes(` ${normalizedPhrase} `);
+}
+
+function feedbackRecordReferenced(record: DynamicFeedbackRecord, normalizedAssistantText: string): boolean {
+  if (feedbackTextIncludes(normalizedAssistantText, record.label)) return true;
+  if (record.aliases.some((alias) => feedbackTextIncludes(normalizedAssistantText, alias))) return true;
+  const keyHits = record.keys.filter((key) => feedbackTextIncludes(normalizedAssistantText, key));
+  if (keyHits.some((key) => normalizeFeedbackText(key).length >= 4)) return true;
+  return keyHits.length >= 2;
+}
+
+function getPriorAssistantResponse(messages: LlmMessageDTO[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "assistant" && typeof message.content === "string" && message.content.trim()) {
+      return message.content;
+    }
+  }
+  return "";
+}
+
+function processPendingDynamicFeedback(cacheKey: string, messages: LlmMessageDTO[]): void {
+  const state = getDynamicFeedbackState(cacheKey);
+  if (!state.pending.length) return;
+  const assistantText = normalizeFeedbackText(getPriorAssistantResponse(messages));
+  if (!assistantText) return;
+  const now = Date.now();
+
+  for (const record of state.pending) {
+    const previous = state.entries[record.entryId] ?? {
+      injections: 0,
+      references: 0,
+      missStreak: 0,
+      lastReferenced: 0,
+      recentInjectionCount: 0,
+    };
+    const referenced = feedbackRecordReferenced(record, assistantText);
+    state.entries[record.entryId] = {
+      ...previous,
+      injections: previous.injections + 1,
+      references: previous.references + (referenced ? 1 : 0),
+      missStreak: referenced ? 0 : previous.missStreak + 1,
+      lastReferenced: referenced ? now : previous.lastReferenced,
+    };
+  }
+
+  state.pending = [];
+}
+
+function buildDynamicFeedbackSnapshot(cacheKey: string): DynamicRetrievalFeedbackSnapshot {
+  const state = getDynamicFeedbackState(cacheKey);
+  const recentCounts = new Map<string, number>();
+  for (const batch of state.recentInjectionEntryIds) {
+    for (const entryId of batch) {
+      recentCounts.set(entryId, (recentCounts.get(entryId) ?? 0) + 1);
+    }
+  }
+
+  return {
+    entries: Object.fromEntries(
+      Object.entries(state.entries).map(([entryId, data]) => [
+        entryId,
+        {
+          ...data,
+          recentInjectionCount: recentCounts.get(entryId) ?? 0,
+        },
+      ]),
+    ),
+  };
+}
+
+function findRuntimeEntry(runtimeBooks: RuntimeBook[], entryId: string): RuntimeBook["cache"]["entries"][number] | null {
+  for (const book of runtimeBooks) {
+    const entry = book.cache.entries.find((item) => item.entryId === entryId);
+    if (entry) return entry;
+  }
+  return null;
+}
+
+function recordDynamicInjection(cacheKey: string, preview: RetrievalPreview | null, runtimeBooks: RuntimeBook[]): void {
+  const state = getDynamicFeedbackState(cacheKey);
+  const dynamicIds = [...new Set((preview?.manifestSelectedEntries ?? []).map((entry) => entry.entryId))];
+  state.pending = dynamicIds
+    .map((entryId): DynamicFeedbackRecord | null => {
+      const entry = findRuntimeEntry(runtimeBooks, entryId);
+      if (!entry || entry.constant) return null;
+      return {
+        entryId,
+        label: entry.label,
+        aliases: [...entry.aliases],
+        keys: [...entry.key, ...entry.keysecondary],
+      };
+    })
+    .filter((item): item is DynamicFeedbackRecord => !!item);
+
+  if (!state.pending.length) return;
+  state.recentInjectionEntryIds.push(state.pending.map((item) => item.entryId));
+  while (state.recentInjectionEntryIds.length > DYNAMIC_FEEDBACK_RECENT_WINDOW) {
+    state.recentInjectionEntryIds.shift();
+  }
+}
+
+function cloneRetrievalFeedItem(item: RetrievalFeedItem): RetrievalFeedItem {
+  return {
+    ...item,
+    scopes: item.scopes?.map((scope) => ({ ...scope })),
+    entries: item.entries?.map((entry) => ({ ...entry, reasons: [...entry.reasons] })),
+    details: item.details ? [...item.details] : undefined,
+  };
+}
+
+function cloneRetrievalSession(session: RetrievalSession): RetrievalSession {
+  return {
+    ...session,
+    items: session.items.map(cloneRetrievalFeedItem),
+  };
+}
+
+function cloneRetrievalFeedState(state: RetrievalFeedState | null | undefined): RetrievalFeedState {
+  return {
+    sessions: (state?.sessions ?? []).map(cloneRetrievalSession),
+  };
+}
+
+function createSessionStartItem(event: Extract<RetrievalProgressEvent, { type: "start" }>): RetrievalFeedItem {
+  return {
+    id: `session:${event.timestamp}:${Math.random().toString(36).slice(2, 8)}`,
+    kind: "trace",
+    label: event.label,
+    summary: event.summary,
+    timestamp: event.timestamp,
+    phase: "session",
+    details: event.details ? [...event.details] : undefined,
+    tone: "info",
+  };
+}
+
+function sortAndTrimRetrievalSessions(sessions: RetrievalSession[]): RetrievalSession[] {
+  return sessions
+    .slice()
+    .sort((left, right) => {
+      if (left.status === "running" && right.status !== "running") return -1;
+      if (right.status === "running" && left.status !== "running") return 1;
+      return right.startedAt - left.startedAt;
+    })
+    .slice(0, RETRIEVAL_FEED_SESSION_LIMIT);
+}
+
+function getOrCreateRetrievalFeed(userId: string, chatId: string): RetrievalFeedState {
+  const key = getPreviewCacheKey(userId, chatId);
+  const cached = retrievalFeedCache.get(key);
+  if (cached) return cached;
+  const next: RetrievalFeedState = { sessions: [] };
+  retrievalFeedCache.set(key, next);
+  return next;
+}
+
+function beginRetrievalSession(
+  userId: string,
+  chatId: string,
+  sessionId: string,
+  event: Extract<RetrievalProgressEvent, { type: "start" }>,
+): void {
+  const feed = getOrCreateRetrievalFeed(userId, chatId);
+  const session: RetrievalSession = {
+    id: sessionId,
+    chatId,
+    mode: event.mode,
+    startedAt: event.timestamp,
+    endedAt: null,
+    status: "running",
+    controllerUsed: false,
+    resolvedConnectionId: null,
+    fallbackReason: null,
+    items: [createSessionStartItem(event)],
+  };
+  feed.sessions = sortAndTrimRetrievalSessions([session, ...feed.sessions.filter((item) => item.id !== sessionId)]);
+}
+
+function appendRetrievalSessionItem(
+  userId: string,
+  chatId: string,
+  sessionId: string,
+  item: RetrievalFeedItem,
+): void {
+  const feed = getOrCreateRetrievalFeed(userId, chatId);
+  const session = feed.sessions.find((candidate) => candidate.id === sessionId);
+  if (!session) return;
+  session.items = [...session.items, cloneRetrievalFeedItem(item)];
+  feed.sessions = sortAndTrimRetrievalSessions(feed.sessions);
+}
+
+function finishRetrievalSession(
+  userId: string,
+  chatId: string,
+  sessionId: string,
+  event: Extract<RetrievalProgressEvent, { type: "finish" }>,
+): void {
+  const feed = getOrCreateRetrievalFeed(userId, chatId);
+  const session = feed.sessions.find((candidate) => candidate.id === sessionId);
+  if (!session) return;
+  session.status = event.status;
+  session.endedAt = event.timestamp;
+  session.controllerUsed = event.controllerUsed;
+  session.resolvedConnectionId = event.resolvedConnectionId;
+  session.fallbackReason = event.fallbackReason;
+  feed.sessions = sortAndTrimRetrievalSessions(feed.sessions);
+}
+
+function scheduleLiveStatePush(userId: string, chatId: string): void {
+  const key = getPreviewCacheKey(userId, chatId);
+  const existing = scheduledStatePushes.get(key);
+  if (existing) clearTimeout(existing);
+  const handle = setTimeout(() => {
+    scheduledStatePushes.delete(key);
+    void resolveActiveChat(userId)
+      .then((activeChat) => {
+        if (activeChat?.id !== chatId) return;
+        return pushState(userId, chatId);
+      })
+      .catch((error) => {
+        spindle.log.warn(
+          `Lore Recall state push failed for chat ${chatId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+  }, RETRIEVAL_FEED_PUSH_DELAY_MS);
+  scheduledStatePushes.set(key, handle);
+}
+
+function summarizeTrace(preview: RetrievalPreview): string {
+  if (!preview.trace.length) return "no traversal trace";
+  return preview.trace
+    .map((step) => `${step.step}:${step.phase}:${step.label}`)
+    .slice(0, 6)
+    .join(" | ");
+}
+
+async function buildState(userId: string, chatId?: string | null): Promise<StateBuildEnvelope> {
+  const [allBooks, activeChat, settings, connections] = await Promise.all([
+    listAllWorldBooks(userId),
+    resolveActiveChat(userId, chatId),
+    loadGlobalSettings(userId),
+    listConnectionsCached(userId),
+  ]);
+
+  const sortedBooks = allBooks
+    .slice()
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map(toBookSummary);
+
+  const cachedPreview = activeChat?.id ? (previewCache.get(getPreviewCacheKey(userId, activeChat.id)) ?? null) : null;
+  const cachedRetrievalFeed = activeChat?.id
+    ? cloneRetrievalFeedState(retrievalFeedCache.get(getPreviewCacheKey(userId, activeChat.id)))
+    : { sessions: [] };
+
+  const baseState: FrontendState = {
+    activeChatId: activeChat?.id ?? null,
+    activeCharacterId: activeChat?.character_id ?? null,
+    activeCharacterName: null,
+    globalSettings: settings,
+    characterConfig: null,
+    allWorldBooks: sortedBooks,
+    managedEntries: {},
+    bookConfigs: {},
+    bookStatuses: {},
+    treeIndexes: {},
+    unassignedCounts: {},
+    availableConnections: connections.map(buildConnectionOption).sort((left, right) => left.name.localeCompare(right.name)),
+    diagnosticsResults: [],
+    suggestedBookIds: [],
+    retrievalFeed: cachedRetrievalFeed,
+    preview: cachedPreview,
+  };
+
+  if (!activeChat?.character_id) {
+    return { state: baseState };
+  }
+
+  const character = await spindle.characters.get(activeChat.character_id, userId);
+  if (!character) {
+    return { state: baseState };
+  }
+
+  const rawCharacterConfig = await loadCharacterConfig(character.id, userId, character);
+  const validBookIds = new Set(allBooks.map((book) => book.id));
+  const selectedBookIds = rawCharacterConfig.managedBookIds.filter((bookId) => validBookIds.has(bookId));
+  const removedBookIds = rawCharacterConfig.managedBookIds.filter((bookId) => !validBookIds.has(bookId));
+
+  // Auto-prune stale managed-book references when the underlying book has been
+  // deleted natively in Lumiverse. Otherwise the UI keeps showing it as "managed"
+  // and there's no way for the user to clear it.
+  let characterConfig = rawCharacterConfig;
+  if (removedBookIds.length > 0) {
+    try {
+      await saveCharacterConfig(character.id, { managedBookIds: selectedBookIds }, userId, character);
+      characterConfig = { ...rawCharacterConfig, managedBookIds: selectedBookIds };
+    } catch (error) {
+      // Cleanup save failed - keep raw config so we don't pretend to have cleaned up
+      // when we didn't. Stale IDs will continue to surface, which is the lesser evil.
+    }
+  }
+
+  const attachedWorldBookIds = character.world_book_ids;
+  const { runtimeBooks, staleIssues } = await getRuntimeBooks(selectedBookIds, attachedWorldBookIds, userId);
+
+  const managedEntries = Object.fromEntries(runtimeBooks.map((book) => [book.summary.id, book.cache.entries]));
+  const bookConfigs = Object.fromEntries(runtimeBooks.map((book) => [book.summary.id, book.config]));
+  const bookStatuses = Object.fromEntries(runtimeBooks.map((book) => [book.summary.id, book.status]));
+  const treeIndexes = Object.fromEntries(runtimeBooks.map((book) => [book.summary.id, book.tree]));
+  const unassignedCounts = Object.fromEntries(runtimeBooks.map((book) => [book.summary.id, book.tree.unassignedEntryIds.length]));
+  const previewDiagnostics =
+    cachedPreview
+      ? [
+          ...(cachedPreview.fallbackPath?.length
+            ? [
+                {
+                  id: "preview-fallback",
+                  severity: "info" as const,
+                  bookId: null,
+                  title: "Last retrieval used fallback behavior",
+                  detail: cachedPreview.fallbackPath.join(" "),
+                },
+              ]
+            : []),
+          ...(cachedPreview.fallbackPath?.some((detail) => /invalid json|did not map|empty nodeids array/i.test(detail))
+            ? [
+                {
+                  id: "preview-scope-selection-failure",
+                  severity: "warn" as const,
+                  bookId: null,
+                  title: "Last retrieval had controller scope-selection trouble",
+                  detail:
+                    "The most recent retrieval fell back because the controller returned invalid JSON, empty nodeIds, or nodeIds that did not map to visible scopes.",
+                },
+              ]
+            : []),
+          ...(cachedPreview.selectedScopes.length > 0 && cachedPreview.pulledNodes.length === 0
+            ? [
+                {
+                  id: "preview-empty-scopes",
+                  severity: "warn" as const,
+                  bookId: null,
+                  title: "Last retrieval scopes resolved no entries",
+                  detail:
+                    "The most recent retrieval chose one or more scopes but resolved no pulled entries. This usually points to overly broad or poorly summarized categories.",
+                },
+              ]
+            : []),
+          ...(cachedPreview.selectedScopes.some(
+            (scope) =>
+              scope.descendantEntryCount > 24 &&
+              typeof scope.manifestEntryCount === "number" &&
+              scope.manifestEntryCount < scope.descendantEntryCount,
+          )
+            ? [
+                {
+                  id: "preview-broad-manifest-scope",
+                  severity: "warn" as const,
+                  bookId: null,
+                  title: "Last retrieval still had a broad manifest scope",
+                  detail:
+                    "One or more selected scopes exposed more than 24 descendant entries, so exact entry choice depended on a broad manifest. Retrieval may still be too wide for clean entry selection.",
+                },
+              ]
+            : []),
+          ...(cachedPreview.recentConversation && /\[narrative|important note:|black box|you represent/i.test(cachedPreview.recentConversation)
+            ? [
+                {
+                  id: "preview-protocol-heavy-context",
+                  severity: "warn" as const,
+                  bookId: null,
+                  title: "Recent retrieval context still contains protocol text",
+                  detail:
+                    "The sanitized recent conversation still appears to contain narrative protocol or policy text, which can distort node and entry selection.",
+                },
+              ]
+            : []),
+        ]
+      : [];
+  const cleanupDiagnostics =
+    removedBookIds.length > 0
+      ? [
+          {
+            id: "managed-book-cleanup",
+            severity: "info" as const,
+            bookId: null,
+            title: `Removed ${removedBookIds.length} stale managed-book reference${removedBookIds.length === 1 ? "" : "s"}`,
+            detail:
+              "One or more lorebooks that were managed by this character were deleted in Lumiverse. Their references have been cleaned up automatically.",
+          },
+        ]
+      : [];
+  const diagnosticsResults = buildDiagnostics(runtimeBooks, staleIssues, settings, characterConfig, connections).concat(
+    cleanupDiagnostics,
+    previewDiagnostics,
+  );
+  const suggestedBookIds = computeSuggestedBookIds(sortedBooks, selectedBookIds, settings);
+
+  const nextState: FrontendState = {
+    ...baseState,
+    activeCharacterId: character.id,
+    activeCharacterName: character.name,
+    characterConfig,
+    managedEntries,
+    bookConfigs,
+    bookStatuses,
+    treeIndexes,
+    unassignedCounts,
+    diagnosticsResults,
+    suggestedBookIds,
+  };
+
+  return {
+    state: nextState,
+  };
+}
+
+async function pushState(userId: string, chatId?: string | null): Promise<void> {
+  const sequence = (latestStateSequence.get(userId) ?? 0) + 1;
+  latestStateSequence.set(userId, sequence);
+
+  const envelope = await buildState(userId, chatId);
+  if (latestStateSequence.get(userId) !== sequence) return;
+
+  rememberChatUser(envelope.state.activeChatId, userId);
+  send({ type: "state", state: envelope.state }, userId);
+}
+
+const activeTrackedOperations = new Map<string, string>();
+
+function createOperationId(kind: OperationKind): string {
+  return `${kind}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function sendOperation(userId: string, operation: OperationUpdate): void {
+  send({ type: "operation", operation }, userId);
+}
+
+function getOperationTitle(kind: OperationKind): string {
+  switch (kind) {
+    case "build_tree_from_metadata":
+      return "Build Tree From Metadata";
+    case "build_tree_with_llm":
+      return "Build Tree With LLM";
+    case "regenerate_summaries":
+      return "Regenerate Summaries";
+    case "export_snapshot":
+      return "Export Snapshot";
+    case "import_snapshot":
+      return "Import Snapshot";
+  }
+}
+
+function summarizeOutcome(kind: OperationKind, outcome: Pick<OperationOutcome<unknown>, "completed" | "total">, issues: OperationIssue[]): string {
+  const issueCount = issues.length;
+  switch (kind) {
+    case "build_tree_with_llm":
+      if (issueCount) return `Built ${outcome.completed} of ${outcome.total} book(s) with ${issueCount} issue(s).`;
+      return `Built ${outcome.completed} book(s) with the LLM.`;
+    case "build_tree_from_metadata":
+      if (issueCount) return `Built ${outcome.completed} of ${outcome.total} metadata tree(s) with ${issueCount} issue(s).`;
+      return `Built ${outcome.completed} metadata tree(s).`;
+    case "regenerate_summaries":
+      if (issueCount) return `Updated ${outcome.completed} of ${outcome.total} summary target(s) with ${issueCount} issue(s).`;
+      return `Updated ${outcome.completed} summary target(s).`;
+    case "export_snapshot":
+      return "Lore Recall snapshot is ready to download.";
+    case "import_snapshot":
+      if (issueCount) return `Imported Lore Recall snapshot with ${issueCount} issue(s).`;
+      return "Imported Lore Recall snapshot.";
+  }
+}
+
+function createInitialOperation(
+  id: string,
+  kind: OperationKind,
+  message: FrontendToBackend,
+): OperationUpdate {
+  return {
+    id,
+    kind,
+    status: "started",
+    title: getOperationTitle(kind),
+    message: "Starting operation...",
+    percent: 0,
+    current: null,
+    total: null,
+    phase: "starting",
+    bookId: null,
+    bookName: null,
+    chunkCurrent: null,
+    chunkTotal: null,
+    retryable: false,
+    finishedAt: null,
+    scope: {
+      chatId: "chatId" in message ? (message.chatId ?? null) : null,
+      bookIds: "bookIds" in message && Array.isArray(message.bookIds) ? message.bookIds : undefined,
+      bookId: "bookId" in message && typeof message.bookId === "string" ? message.bookId : null,
+      entryIds: "entryIds" in message && Array.isArray(message.entryIds) ? message.entryIds : undefined,
+      nodeIds: "nodeIds" in message && Array.isArray(message.nodeIds) ? message.nodeIds : undefined,
+    },
+    issues: [],
+  };
+}
+
+async function runTrackedOperation<T>(
+  userId: string,
+  message: FrontendToBackend,
+  kind: OperationKind,
+  runner: (operation: OperationContext) => Promise<OperationOutcome<T>>,
+  onSuccess?: (value: T) => Promise<void> | void,
+): Promise<void> {
+  if (activeTrackedOperations.has(userId)) {
+    send(
+      {
+        type: "error",
+        message: "Another Lore Recall operation is already running. Wait for it to finish before starting a new one.",
+      },
+      userId,
+    );
+    return;
+  }
+
+  const id = createOperationId(kind);
+  const issues: OperationIssue[] = [];
+  let operation = createInitialOperation(id, kind, message);
+  activeTrackedOperations.set(userId, id);
+  sendOperation(userId, operation);
+
+  const context: OperationContext = {
+    progress(update) {
+      operation = {
+        ...operation,
+        status: operation.status === "started" ? "running" : operation.status,
+        ...update,
+        percent: typeof update.percent === "number" ? Math.max(0, Math.min(100, update.percent)) : operation.percent,
+        current: typeof update.current === "number" ? update.current : operation.current,
+        total: typeof update.total === "number" ? update.total : operation.total,
+        phase: typeof update.phase === "undefined" ? operation.phase : (update.phase ?? null),
+        bookId: typeof update.bookId === "undefined" ? operation.bookId : (update.bookId ?? null),
+        bookName: typeof update.bookName === "undefined" ? operation.bookName : (update.bookName ?? null),
+        chunkCurrent: typeof update.chunkCurrent === "undefined" ? operation.chunkCurrent : (update.chunkCurrent ?? null),
+        chunkTotal: typeof update.chunkTotal === "undefined" ? operation.chunkTotal : (update.chunkTotal ?? null),
+        message: update.message ?? operation.message,
+        issues: [...issues],
+      };
+      sendOperation(userId, operation);
+    },
+    addIssue(issue) {
+      issues.push(issue);
+      operation = {
+        ...operation,
+        issues: [...issues],
+      };
+      sendOperation(userId, operation);
+    },
+  };
+
+  try {
+    const outcome = await runner(context);
+    const allIssues = outcome.issues.length ? outcome.issues : issues;
+    const failed = outcome.completed === 0 && outcome.total > 0 && allIssues.length > 0;
+
+    if (onSuccess && typeof outcome.value !== "undefined" && !failed) {
+      await onSuccess(outcome.value);
+    }
+
+    operation = {
+      ...operation,
+      status: failed ? "failed" : "completed",
+      message: summarizeOutcome(kind, outcome, allIssues),
+      percent: failed ? operation.percent : 100,
+      current: outcome.total > 0 ? outcome.completed : operation.current,
+      total: outcome.total > 0 ? outcome.total : operation.total,
+      retryable: failed,
+      finishedAt: Date.now(),
+      issues: allIssues,
+    };
+    sendOperation(userId, operation);
+    await pushState(userId, "chatId" in message ? message.chatId : null);
+  } catch (error: unknown) {
+    const issue: OperationIssue = {
+      severity: "error",
+      message: error instanceof Error ? error.message : "Unknown Lore Recall operation error",
+      phase: operation.phase ?? null,
+      bookId: operation.bookId ?? null,
+      bookName: operation.bookName ?? null,
+    };
+    issues.push(issue);
+    operation = {
+      ...operation,
+      status: "failed",
+      message: issue.message,
+      retryable: true,
+      finishedAt: Date.now(),
+      issues: [...issues],
+    };
+    spindle.log.error(`Lore Recall ${kind} failed: ${issue.message}`);
+    sendOperation(userId, operation);
+  } finally {
+    activeTrackedOperations.delete(userId);
+  }
+}
+
+spindle.registerInterceptor(async (messages, context) => {
+  let liveChatId: string | null = null;
+  let liveUserId: string | null = null;
+  let retrievalSessionId: string | null = null;
+  let retrievalSessionStarted = false;
+  let retrievalSessionFinished = false;
+  try {
+    const chatId =
+      context && typeof context === "object" && typeof (context as { chatId?: unknown }).chatId === "string"
+        ? ((context as { chatId?: unknown }).chatId as string)
+        : null;
+    const connectionId =
+      context && typeof context === "object" && typeof (context as { connectionId?: unknown }).connectionId === "string"
+        ? ((context as { connectionId?: unknown }).connectionId as string)
+        : null;
+    if (!chatId) return messages;
+    liveChatId = chatId;
+
+    const userId = resolveUserId(chatId);
+    if (!userId) {
+      spindle.log.warn(`Lore Recall skipped retrieval for chat ${chatId} because no user context was available yet.`);
+      return messages;
+    }
+    liveUserId = userId;
+
+    await ensureStorageFolders(userId);
+    const settings = await loadGlobalSettings(userId);
+    if (!settings.enabled) return messages;
+
+    const chat = await spindle.chats.get(chatId, userId);
+    if (!chat?.character_id) return messages;
+
+    const character = await spindle.characters.get(chat.character_id, userId);
+    if (!character) return messages;
+    const config = await loadCharacterConfig(chat.character_id, userId, character);
+    if (!config.enabled || !config.managedBookIds.length) return messages;
+
+    // Fork: native mode injects via the world-info interceptor (before prompt
+    // assembly, so entries land at their authored positions incl. {{wi_marker}}).
+    // The post-assembly path must not also run retrieval or inject.
+    if (config.injectionMode === "native") return messages;
+
+    const attachedWorldBookIds = character.world_book_ids;
+    const { runtimeBooks } = await getRuntimeBooks(config.managedBookIds, attachedWorldBookIds, userId);
+    if (!runtimeBooks.length) return messages;
+
+    const previewCacheKey = getPreviewCacheKey(userId, chatId);
+    processPendingDynamicFeedback(previewCacheKey, messages as LlmMessageDTO[]);
+    const dynamicFeedback = buildDynamicFeedbackSnapshot(previewCacheKey);
+
+    retrievalSessionId = `retrieval:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const handleProgress = (event: RetrievalProgressEvent) => {
+      if (!retrievalSessionId) return;
+      switch (event.type) {
+        case "start":
+          retrievalSessionStarted = true;
+          beginRetrievalSession(userId, chatId, retrievalSessionId, event);
+          scheduleLiveStatePush(userId, chatId);
+          return;
+        case "item":
+          if (!retrievalSessionStarted) return;
+          appendRetrievalSessionItem(userId, chatId, retrievalSessionId, event.item);
+          scheduleLiveStatePush(userId, chatId);
+          return;
+        case "finish":
+          if (!retrievalSessionStarted) return;
+          retrievalSessionFinished = true;
+          finishRetrievalSession(userId, chatId, retrievalSessionId, event);
+          scheduleLiveStatePush(userId, chatId);
+          return;
+      }
+    };
+
+    const preview = await buildRetrievalPreview(
+      messages as Array<{ role: "system" | "user" | "assistant"; content: string }>,
+      settings,
+      config,
+      runtimeBooks,
+      userId,
+      {
+        connectionId,
+        isActual: true,
+        capturedAt: Date.now(),
+        reportProgress: handleProgress,
+        dynamicFeedback,
+      },
+    );
+    previewCache.set(previewCacheKey, preview);
+    recordDynamicInjection(previewCacheKey, preview, runtimeBooks);
+    scheduleLiveStatePush(userId, chatId);
+    if (preview) {
+      if (preview.mode === "traversal" && preview.fallbackReason) {
+        spindle.log.info(
+          `Lore Recall traversal fell back for chat ${chatId}: ${preview.fallbackReason} [trace=${summarizeTrace(preview)}]`,
+        );
+      } else if (preview.mode === "traversal" && preview.controllerUsed) {
+        spindle.log.info(
+          `Lore Recall traversal used controller for chat ${chatId}: scopes=${preview.retrievedScopes.length}, pulled=${preview.pulledNodes.length}, injected=${preview.injectedNodes.length}, connection=${preview.resolvedConnectionId ?? "default"}, trace=${summarizeTrace(preview)}`,
+        );
+      } else if (preview.mode === "collapsed" && preview.fallbackReason) {
+        spindle.log.info(
+          `Lore Recall collapsed retrieval used fallback behavior for chat ${chatId}: ${preview.fallbackReason}`,
+        );
+      }
+    }
+    if (!preview?.injectedText.trim()) return messages;
+
+    // Fork: place the assembled block at the configured position (start/end/depth),
+    // tagged as a Prompt Breakdown entry for attribution.
+    return placeAssembledInjection(messages as LlmMessageDTO[], preview.injectedText, config);
+  } catch (error: unknown) {
+    if (liveChatId && liveUserId && retrievalSessionId && retrievalSessionStarted && !retrievalSessionFinished) {
+      const activeSession = retrievalFeedCache
+        .get(getPreviewCacheKey(liveUserId, liveChatId))
+        ?.sessions.find((session) => session.id === retrievalSessionId);
+      appendRetrievalSessionItem(liveUserId, liveChatId, retrievalSessionId, {
+        id: `issue:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+        kind: "issue",
+        label: "Retrieval failed",
+        summary: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+        phase: "fallback",
+        tone: "error",
+      });
+      finishRetrievalSession(liveUserId, liveChatId, retrievalSessionId, {
+        type: "finish",
+        timestamp: Date.now(),
+        status: "failed",
+        controllerUsed: activeSession?.controllerUsed ?? false,
+        resolvedConnectionId: activeSession?.resolvedConnectionId ?? null,
+        fallbackReason: error instanceof Error ? error.message : String(error),
+      });
+      scheduleLiveStatePush(liveUserId, liveChatId);
+    }
+    spindle.log.warn(`Lore Recall interceptor failed: ${error instanceof Error ? error.message : String(error)}`);
+    return messages;
+  }
+}, 95);
+
+// ---------------------------------------------------------------------------
+// Fork: native injection path. Runs BEFORE world-info activation. Force-
+// activates exactly the entries Lore Recall selected and (optionally) disables
+// the rest of the managed-book candidates, so each selected entry lands at ITS
+// authored world-info position — including position 7 ("At Marker"), which the
+// host injects via {{wi_marker}}. This is the only host-supported way to reach
+// the marker, and it removes the double-injection native keyword firing would
+// otherwise add. Requires the managed book attached; reported in the feed if not.
+// ---------------------------------------------------------------------------
+spindle.registerWorldInfoInterceptor(async (ctx) => {
+  const chatId = ctx.chatId;
+  const userId = ctx.userId ?? resolveUserId(chatId);
+  if (!chatId || !userId) return;
+
+  let sessionId: string | null = null;
+  let sessionStarted = false;
+  let sessionFinished = false;
+  try {
+    await ensureStorageFolders(userId);
+    const settings = await loadGlobalSettings(userId);
+    if (!settings.enabled) return;
+    const chat = await spindle.chats.get(chatId, userId);
+    if (!chat?.character_id) return;
+    const character = await spindle.characters.get(chat.character_id, userId);
+    if (!character) return;
+    const config = await loadCharacterConfig(chat.character_id, userId, character);
+    if (!config.enabled || !config.managedBookIds.length) return;
+    if (config.injectionMode !== "native") return;
+
+    const { runtimeBooks } = await getRuntimeBooks(config.managedBookIds, character.world_book_ids, userId);
+    if (!runtimeBooks.length) return;
+
+    const interceptorMessages = ctx.messages
+      .filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant")
+      .map((m) => ({ role: m.role, content: m.content }));
+    if (!interceptorMessages.length) return;
+
+    sessionId = `retrieval:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const handleProgress = (event: RetrievalProgressEvent) => {
+      if (!sessionId) return;
+      switch (event.type) {
+        case "start":
+          sessionStarted = true;
+          beginRetrievalSession(userId, chatId, sessionId, event);
+          scheduleLiveStatePush(userId, chatId);
+          return;
+        case "item":
+          if (!sessionStarted) return;
+          appendRetrievalSessionItem(userId, chatId, sessionId, event.item);
+          scheduleLiveStatePush(userId, chatId);
+          return;
+        case "finish":
+          if (!sessionStarted) return;
+          sessionFinished = true;
+          finishRetrievalSession(userId, chatId, sessionId, event);
+          scheduleLiveStatePush(userId, chatId);
+          return;
+      }
+    };
+
+    const preview = await buildRetrievalPreview(
+      interceptorMessages as Array<{ role: "system" | "user" | "assistant"; content: string }>,
+      settings,
+      config,
+      runtimeBooks,
+      userId,
+      {
+        isActual: true,
+        capturedAt: Date.now(),
+        reportProgress: handleProgress,
+        controllerBudgetMs: WORLD_INFO_CONTROLLER_BUDGET_MS,
+      },
+    );
+    previewCache.set(getPreviewCacheKey(userId, chatId), preview);
+    scheduleLiveStatePush(userId, chatId);
+    if (!preview) return;
+
+    const managedBookIds = new Set(config.managedBookIds);
+    const selectedEntryIds = new Set(preview.injectedNodes.map((node) => node.entryId));
+    const candidateIds = new Set(ctx.entries.map((entry) => entry.id));
+
+    const forced: string[] = [];
+    const enabled: string[] = [];
+    const disabled: string[] = [];
+    for (const entry of ctx.entries) {
+      if (selectedEntryIds.has(entry.id)) {
+        forced.push(entry.id);
+        if (entry.disabled) enabled.push(entry.id);
+      } else if (managedBookIds.has(entry.world_book_id) && config.nativeDisableUnselected) {
+        disabled.push(entry.id);
+      }
+    }
+
+    const unreachable = [...selectedEntryIds].filter((id) => !candidateIds.has(id));
+    if (unreachable.length && sessionId && sessionStarted) {
+      appendRetrievalSessionItem(userId, chatId, sessionId, {
+        id: `issue:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+        kind: "issue",
+        label: "Native injection: entries not active",
+        summary: `${unreachable.length} selected entr${unreachable.length === 1 ? "y is" : "ies are"} not active world-info candidate(s). Attach the managed book to the character so native injection can place them (e.g. at {{wi_marker}}).`,
+        timestamp: Date.now(),
+        phase: "inject",
+        tone: "warn",
+      });
+      scheduleLiveStatePush(userId, chatId);
+      spindle.log.warn(
+        `Lore Recall native injection could not reach ${unreachable.length} selected entr${unreachable.length === 1 ? "y" : "ies"} for chat ${chatId}; the managed book is likely not attached.`,
+      );
+    }
+
+    spindle.log.info(
+      `Lore Recall native injection for chat ${chatId}: forced=${forced.length}, disabled=${disabled.length}, enabled=${enabled.length}.`,
+    );
+    return { forced, enabled, disabled };
+  } catch (error: unknown) {
+    if (sessionId && sessionStarted && !sessionFinished) {
+      finishRetrievalSession(userId, chatId, sessionId, {
+        type: "finish",
+        timestamp: Date.now(),
+        status: "failed",
+        controllerUsed: false,
+        resolvedConnectionId: null,
+        fallbackReason: error instanceof Error ? error.message : String(error),
+      });
+      scheduleLiveStatePush(userId, chatId);
+    }
+    spindle.log.warn(
+      `Lore Recall world-info interceptor failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return;
+  }
+}, 95);
+
+spindle.onFrontendMessage(async (payload, userId) => {
+  setLastFrontendUserId(userId);
+  const message = payload as FrontendToBackend;
+  rememberChatUser(readChatIdFromMessage(message), userId);
+
+  try {
+    await ensureStorageFolders(userId);
+
+    switch (message.type) {
+      case "ready":
+        await pushState(userId, message.chatId);
+        break;
+
+      case "refresh":
+      case "run_diagnostics":
+        // User-initiated refresh always sees fresh data — bust the world-book list cache
+        // so brand-new lorebooks created in Lumiverse surface immediately.
+        invalidateWorldBookListCache(userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "save_global_settings":
+        await saveGlobalSettings(message.patch, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "save_character_config":
+        await saveCharacterConfig(message.characterId, message.patch, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "save_book_config":
+        await saveBookConfig(message.bookId, message.patch, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "save_entry_meta":
+        await updateEntryMeta(message.entryId, message.meta, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "patch_entry_flags":
+        await patchEntryFlags(message.entryIds, message.patch, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "save_category":
+        await updateCategory(message.bookId, message.nodeId, message.patch, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "create_category":
+        await createCategory(message.bookId, message.parentId, message.label, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "move_category":
+        await moveCategory(message.bookId, message.nodeId, message.parentId, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "delete_category":
+        await deleteCategory(message.bookId, message.nodeId, message.target, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "assign_entries":
+        await assignEntries(message.bookId, message.entryIds, message.target, userId);
+        await pushState(userId, message.chatId);
+        break;
+
+      case "build_tree_from_metadata":
+        await runTrackedOperation(userId, message, "build_tree_from_metadata", (operation) =>
+          buildTreeFromMetadata(message.bookIds, userId, operation),
+        );
+        break;
+
+      case "build_tree_with_llm":
+        await runTrackedOperation(userId, message, "build_tree_with_llm", (operation) =>
+          buildTreeWithLlm(message.bookIds, userId, operation),
+        );
+        break;
+
+      case "regenerate_summaries":
+        await runTrackedOperation(userId, message, "regenerate_summaries", (operation) =>
+          regenerateSummaries(message.bookId, message.entryIds, message.nodeIds, userId, operation),
+        );
+        break;
+
+      case "export_snapshot":
+        await runTrackedOperation(
+          userId,
+          message,
+          "export_snapshot",
+          (operation) => exportSnapshot(userId, operation),
+          async (snapshot) => {
+            send(
+              {
+                type: "export_snapshot_ready",
+                filename: `lore-recall-${new Date(snapshot.exportedAt).toISOString().slice(0, 10)}.json`,
+                snapshot,
+              },
+              userId,
+            );
+          },
+        );
+        break;
+
+      case "import_snapshot":
+        await runTrackedOperation(userId, message, "import_snapshot", (operation) =>
+          importSnapshot(message.snapshot, userId, operation),
+        );
+        break;
+
+      case "apply_suggested_books":
+        await applySuggestedBooks(message.characterId, message.bookIds, message.mode, userId);
+        await pushState(userId, message.chatId);
+        break;
+    }
+  } catch (error: unknown) {
+    const description = error instanceof Error ? error.message : "Unknown Lore Recall error";
+    spindle.log.error(`Lore Recall error: ${description}`);
+    send({ type: "error", message: description }, userId);
+  }
+});
+
+spindle.log.info("Lore Recall loaded.");

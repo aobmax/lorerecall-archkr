@@ -1,0 +1,67 @@
+Lore Recall+  (fork of your installed 1.0.0-TESTING)  -  version 1.1.0-fork
+===========================================================================
+
+WHY THE EARLIER .tar DID NOT INSTALL
+------------------------------------
+Lumiverse installs extensions by GIT-CLONING a repository into
+   <Lumiverse data>\extensions\<identifier>\repo\
+It does NOT have an "import a .zip/.tar" option. That is why the tarball could
+not be imported. At runtime Lumiverse only loads the built files named in
+spindle.json (dist\backend.js and dist\frontend.js) from inside that repo\ folder.
+
+This package is therefore an OVERLAY for that repo\ folder, plus an optional
+"push to Git and install by URL" path.
+
+The extension identifier is unchanged (lore_recall), so this is a drop-in update
+that KEEPS your existing trees, per-character configs, and snapshots (they live
+in the sibling  ...\extensions\lore_recall\storage\  folder, which you do NOT touch).
+
+
+METHOD A  -  drop-in over your existing install  (recommended)
+--------------------------------------------------------------
+1. Fully stop / close Lumiverse (stop the backend process).
+
+2. Open your Lumiverse backend data folder and go to:
+        ...\extensions\lore_recall\repo\
+   (This is exactly the folder your uploaded .7z came from.)
+
+3. RECOMMENDED: back up that repo\ folder first - copy it somewhere safe.
+
+4. From THIS package, open the "repo" folder and copy its CONTENTS into the
+   repo\ folder from step 2, overwriting when prompted.
+      - Keep the existing  .git\ ,  node_modules\ , and the sibling  storage\  folders.
+        (Do not delete them. node_modules is only needed if you rebuild; .git is
+         only used for update checks; storage holds YOUR data.)
+      - Minimal essential files, if you would rather copy just those:
+            dist\backend.js
+            dist\frontend.js
+            spindle.json
+
+5. Start Lumiverse. Open Extensions - "Lore Recall" should now read version
+   1.1.0-fork. If it does not pick up immediately, toggle it off/on or reload.
+
+New controls:
+   Lore Recall -> Retrieval :  "Context token budget" slider,
+                               Injection mode / position / role / depth.
+   Lore Recall -> Advanced  :  "Recent message limit",  "Controller reasoning".
+
+
+METHOD B  -  clean install via Lumiverse's normal installer
+-----------------------------------------------------------
+1. Create a Git repository (e.g. on GitHub) and push the CONTENTS of this
+   package's "repo" folder to it (so spindle.json is at the repo root).
+2. In Lumiverse: Extensions -> Install -> paste the repo URL -> Install ->
+   grant the requested permissions (they are the SAME as before; nothing new).
+This is the path Lumiverse is actually built for (clone-from-URL).
+
+
+NOTES
+-----
+- No new permissions are required. The native-injection feature uses the existing
+  "generation" permission; the token-count feature requires none.
+- Native {{wi_marker}} injection requires the managed book to be ATTACHED to the
+  character (Lumiverse only exposes attached entries to the world-info hook).
+  See  repo\FORK_NOTES.md  for the two recommended setups (both avoid double
+  injection) and details on the token-budget window.
+- To rebuild from source: install bun, then inside repo\ run:  bun install  &&  bun run build
+- What changed vs your 1.0.0-TESTING:  see  repo\CHANGELOG.md
