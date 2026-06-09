@@ -1,0 +1,2 @@
+# Dependencies (installed locally for build/typecheck; dist/ is committed as the shipped artifact)
+node_modules/
