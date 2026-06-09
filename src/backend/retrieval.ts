@@ -4469,10 +4469,24 @@ export async function buildRetrievalPreview(
   let usedSearchFrontier = false;
   const fallbackPath: string[] = [];
 
-  if (!deterministic.length) {
-    fallbackPath.push("Deterministic scoring found no matching dynamic entries.");
+  if (!deterministic.length && !allowController) {
+    // No keyword matches and no controller available to fall back on.
+    fallbackPath.push("Deterministic scoring found no matching dynamic entries and the controller is disabled.");
     pushTrace(trace, "fallback", "No scored entries", fallbackPath[0]);
   } else {
+    if (!deterministic.length) {
+      // Fork: keyword scoring matched nothing (common for CJK, transliterated, or
+      // paraphrased context). Don't give up — let the controller pick scopes and
+      // entries straight from the tree. Candidates are collected from the chosen
+      // scopes (base-scored), not from keyword hits, so this still yields lore,
+      // and semantic selection is exactly what the controller is for.
+      pushTrace(
+        trace,
+        "choose_scope",
+        "No keyword matches — controller-led selection",
+        "Deterministic scoring matched no entries; the controller will choose scopes and entries from the tree.",
+      );
+    }
     const scopeSelectionStartedAt = Date.now();
     const scopeSelection =
       config.searchMode === "traversal"

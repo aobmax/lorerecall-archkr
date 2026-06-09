@@ -3887,10 +3887,13 @@ async function buildRetrievalPreview(messages, settings, config, books, userId, 
   let entrySelectionDurationMs = null;
   let usedSearchFrontier = false;
   const fallbackPath = [];
-  if (!deterministic.length) {
-    fallbackPath.push("Deterministic scoring found no matching dynamic entries.");
+  if (!deterministic.length && !allowController) {
+    fallbackPath.push("Deterministic scoring found no matching dynamic entries and the controller is disabled.");
     pushTrace(trace, "fallback", "No scored entries", fallbackPath[0]);
   } else {
+    if (!deterministic.length) {
+      pushTrace(trace, "choose_scope", "No keyword matches \u2014 controller-led selection", "Deterministic scoring matched no entries; the controller will choose scopes and entries from the tree.");
+    }
     const scopeSelectionStartedAt = Date.now();
     const scopeSelection = config.searchMode === "traversal" ? {
       scopes: chosenBooks.map((book) => ({ book, nodeId: book.tree.rootId })),
@@ -6782,6 +6785,8 @@ if (typeof spindle.registerWorldInfoInterceptor === "function") {
       const interceptorMessages = ctx.messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: m.content }));
       if (!interceptorMessages.length)
         return;
+      const nativeConnections = await spindle.connections.list(userId).catch(() => []);
+      const nativeFallbackConnectionId = nativeConnections.find((connection) => connection.is_default)?.id ?? nativeConnections[0]?.id ?? null;
       sessionId = `retrieval:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
       const handleProgress = (event) => {
         if (!sessionId)
@@ -6808,6 +6813,7 @@ if (typeof spindle.registerWorldInfoInterceptor === "function") {
         }
       };
       const preview = await buildRetrievalPreview(interceptorMessages, settings, config, runtimeBooks, userId, {
+        connectionId: nativeFallbackConnectionId,
         isActual: true,
         capturedAt: Date.now(),
         reportProgress: handleProgress,

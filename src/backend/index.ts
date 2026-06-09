@@ -955,6 +955,18 @@ spindle.registerWorldInfoInterceptor(async (ctx) => {
       .map((m) => ({ role: m.role, content: m.content }));
     if (!interceptorMessages.length) return;
 
+    // Fork: the world-info interceptor context carries no active connection, so
+    // give the controller a usable one. The configured controller connection
+    // still takes priority inside buildRetrievalPreview; this supplies the
+    // fallback — the user's default connection, else the first available.
+    // Without it the controller's generation has no connection in native mode
+    // and the host rejects it, forcing deterministic fallback.
+    const nativeConnections = await spindle.connections
+      .list(userId)
+      .catch(() => [] as ConnectionProfileDTO[]);
+    const nativeFallbackConnectionId =
+      nativeConnections.find((connection) => connection.is_default)?.id ?? nativeConnections[0]?.id ?? null;
+
     sessionId = `retrieval:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     const handleProgress = (event: RetrievalProgressEvent) => {
       if (!sessionId) return;
@@ -985,6 +997,7 @@ spindle.registerWorldInfoInterceptor(async (ctx) => {
       runtimeBooks,
       userId,
       {
+        connectionId: nativeFallbackConnectionId,
         isActual: true,
         capturedAt: Date.now(),
         reportProgress: handleProgress,
